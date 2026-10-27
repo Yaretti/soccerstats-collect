@@ -1,0 +1,56 @@
+
+name: Collect SoccerSTATS second-half stats
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check repository files
+        run: |
+          echo "Repository root:"
+          pwd
+          echo "Files:"
+          find . -maxdepth 3 -type f | sort
+
+      - name: Run SoccerSTATS parser
+        run: |
+          if [ -f "src/soccerstats_collect.py" ]; then
+            python src/soccerstats_collect.py
+          elif [ -f "soccerstats_collect.py" ]; then
+            python soccerstats_collect.py
+          else
+            echo "ERROR: Parser file not found."
+            exit 1
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soccerstats-results-${{ github.run_number }}
+          path: |
+            output/
+            debug/
+          if-no-files-found: warn
+          retention-days: 14
