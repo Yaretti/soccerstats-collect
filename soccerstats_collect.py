@@ -1,110 +1,371 @@
+
 #!/usr/bin/env python3
-"""Збір голів 2-го тайму з SoccerSTATS (halftime.asp) -> soccerstats_stats.csv
-Запуск: python3 soccerstats_collect.py   (pip install requests beautifulsoup4)
-Можна перервати й запустити знову: вже зібрані ліги пропускаються.
-УВАГА: код написано без тесту на живому сайті; спершу пробний запуск: python3 soccerstats_collect.py qatar
+# -*- coding: utf-8 -*-
+
 """
-import csv, os, re, sys, time
+SoccerSTATS collector
+Table: Match total goals stats in the SECOND HALF
+
+Initial test: England only.
+Output: output/soccerstats_second_half.csv
+Diagnostics: debug/
+"""
+
+import csv
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
 import requests
 from bs4 import BeautifulSoup
 
-BASE = 'https://www.soccerstats.com/'
-UA = {'User-Agent': 'Mozilla/5.0 (GreenlineGoal league rating, low-rate)'}
-DELAY = 4  # секунд між запитами, не зменшувати
-OUT = 'soccerstats_stats.csv'
-FIELDS = ['slug', 'league_name', 'season_label', 'matches', 'p05', 'p15', 'p25', 'avg_goals_2h', 'matches_table', 'url']
+BASE_URL = "https://www.soccerstats.com/halftime.asp"
 
-def get(url):
-    r = requests.get(url, headers=UA, timeout=30)
-    r.raise_for_status()
-    time.sleep(DELAY)
-    return r.text
+# Початковий тест однієї ліги.
+# Інші ліги додаватимемо після перевірки результату.
+LEAGUES = {
+    "england": "England",
+}
 
-def list_leagues():
-    soup = BeautifulSoup(get(BASE + 'leagues.asp'), 'html.parser')
-    out = {}
-    for a in soup.find_all('a', href=True):
-        m = re.search(r'latest\.asp\?league=([a-z0-9]+)$', a['href'])
-        if m and a.get_text(strip=True):
-            out.setdefault(m.group(1), a.get_text(' ', strip=True))
-    return out
+OUTPUT_DIR = Path("output")
+DEBUG_DIR = Path("debug")
+CSV_FILE = OUTPUT_DIR / "soccerstats_second_half.csv"
 
-def table_after(soup, pattern):
-    el = soup.find(string=re.compile(pattern))
-    return el.find_next('table') if el else None
+REQUEST_DELAY = 3
+TIMEOUT = 30
 
-def rows_of(t):
-    """Рядки лише цієї таблиці (без вкладених), щоб не рахувати дублі."""
-    for tr in t.find_all('tr'):
-        if tr.find_parent('table') is not t or tr.find('table'):
+CSV_COLUMNS = [
+    "league_slug",
+    "league_name",
+    "team",
+    "GP",
+    "Avg",
+    "0.5+",
+    "1.5+",
+    "2.5+",
+    "3.5+",
+    "source_url",
+    "collected_at_utc",
+]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def clean(value):
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def normalize_header(value):
+    value = clean(value).lower()
+    value = value.replace(" ", "").replace("%", "")
+    return value.replace("–", "-").replace("—", "-")
+
+
+def parse_number(value):
+    """Повертає число або None, якщо значення відсутнє."""
+    value = clean(value).replace(",", ".")
+    match = re.search(r"-?\d+(?:\.\d+)?", value)
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def row_cells(row):
+    """Читає лише безпосередні клітинки рядка."""
+    return [
+        clean(cell.get_text(" ", strip=True))
+        for cell in row.find_all(
+            ["th", "td"],
+            recursive=False,
+        )
+    ]
+
+
+def find_statistics_table(soup):
+    """
+    Знаходить таблицю за заголовками:
+    Teams (Second-Half), GP, Avg, 0.5+, 1.5+.
+    """
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+
+        for row_index, row in enumerate(rows):
+            cells = row_cells(row)
+
+            if not cells:
+                continue
+
+            headers = [
+                normalize_header(cell)
+                for cell in cells
+            ]
+
+            team_column = any(
+                "team" in header
+                and (
+                    "second-half" in header
+                    or "secondhalf" in header
+                )
+                for header in headers
+            )
+
+            required = (
+                team_column
+                and "gp" in headers
+                and "avg" in headers
+                and any(
+                    h in {"0.5", "0.5+"}
+                    for h in headers
+                )
+                and any(
+                    h in {"1.5", "1.5+"}
+                    for h in headers
+                )
+            )
+
+            if required:
+                return table, rows, row_index, headers
+
+    return None, [], -1, []
+
+
+def save_debug(slug, html, message):
+    """Зберігає HTML сторінки та опис проблеми."""
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+    (DEBUG_DIR / f"{slug}.html").write_text(
+        html,
+        encoding="utf-8",
+    )
+
+    (DEBUG_DIR / f"{slug}.txt").write_text(
+        message + "\n",
+        encoding="utf-8",
+    )
+
+
+def fetch_league(session, slug, league_name):
+    url = f"{BASE_URL}?league={slug}"
+
+    print(f"\n[INFO] Ліга: {league_name}")
+    print(f"[URL] {url}")
+
+    response = session.get(
+        url,
+        timeout=TIMEOUT,
+    )
+
+    print(f"[HTTP] {response.status_code}")
+    print(
+        "[CONTENT-TYPE] "
+        + response.headers.get("content-type", "unknown")
+    )
+    print(f"[HTML-BYTES] {len(response.content)}")
+
+    response.raise_for_status()
+
+    if len(response.content) < 1000:
+        save_debug(
+            slug,
+            response.text,
+            "Відповідь надто коротка: можливо, блокування або помилка сайту.",
+        )
+        raise RuntimeError("Отримано надто коротку HTML-сторінку.")
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
+
+    table, rows, header_index, headers = (
+        find_statistics_table(soup)
+    )
+
+    if table is None:
+        save_debug(
+            slug,
+            response.text,
+            "Не знайдено очікувану таблицю статистики другого тайму.",
+        )
+        raise RuntimeError(
+            "Таблицю не знайдено. Перевір debug/"
+        )
+
+    def index_of(*names):
+        for name in names:
+            if name in headers:
+                return headers.index(name)
+        return None
+
+    team_index = next(
+        i
+        for i, header in enumerate(headers)
+        if "team" in header
+        and (
+            "second-half" in header
+            or "secondhalf" in header
+        )
+    )
+
+    indexes = {
+        "GP": index_of("gp"),
+        "Avg": index_of("avg"),
+        "0.5+": index_of("0.5+", "0.5"),
+        "1.5+": index_of("1.5+", "1.5"),
+        "2.5+": index_of("2.5+", "2.5"),
+        "3.5+": index_of("3.5+", "3.5"),
+    }
+
+    records = []
+    collected_at = datetime.now(
+        timezone.utc
+    ).isoformat(timespec="seconds")
+
+    for row in rows[header_index + 1:]:
+        cells = row_cells(row)
+
+        if not cells or team_index >= len(cells):
             continue
-        yield [x.get_text(' ', strip=True) for x in tr.find_all(['td', 'th'], recursive=False)]
 
-def parse_page(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    seasons = {}
-    for a in soup.find_all('a', href=True):
-        m = re.search(r'latest\.asp\?league=([a-z0-9_]+)', a['href'])
-        t = a.get_text(strip=True)
-        if m and re.fullmatch(r'20\d\d(/\d{2,4})?', t):
-            seasons[t] = m.group(1)
-    # таблиця 2Т (46-90): сума GP та GF
-    t = table_after(soup, r'Second Half table \(46-90 min\.\)\s*$')
-    gp = gf = 0
-    if t:
-        for c in rows_of(t):
-            if len(c) >= 8 and c[-8].isdigit() and c[-4].isdigit():
-                gp += int(c[-8]); gf += int(c[-4])
-    matches_table = gp // 2 if gp and gp % 2 == 0 else None
-    # офіційна кількість зіграних матчів зі сторінки
-    m = re.search(r'([\d,]+)\s+matches played', soup.get_text(' '))
-    played = int(m.group(1).replace(',', '')) if m else None
-    matches = played or matches_table
-    # League average у блоці SECOND HALF (загальний, не home/away)
-    tt = table_after(soup, r'^\s*Match (total )?goals stats in the SECOND HALF\s*$')
-    pct = None
-    if tt:
-        for c in rows_of(tt):
-            if any(x == 'League average' for x in c):
-                p = [float(x.rstrip('%')) for x in c if re.fullmatch(r'\d+(\.\d+)?%', x)]
-                if len(p) >= 3: pct = p[:3]
-                break
-    avg = round(gf / matches_table, 2) if matches_table else None
-    return seasons, matches, matches_table, avg, pct
+        team = clean(cells[team_index])
+
+        if not team:
+            continue
+
+        gp_index = indexes["GP"]
+        avg_index = indexes["Avg"]
+
+        if (
+            gp_index is None
+            or avg_index is None
+            or max(gp_index, avg_index) >= len(cells)
+        ):
+            continue
+
+        gp = parse_number(cells[gp_index])
+        avg = parse_number(cells[avg_index])
+
+        # Пропускаємо заголовки, підсумки та невалідні рядки.
+        if gp is None or avg is None:
+            continue
+
+        record = {
+            "league_slug": slug,
+            "league_name": league_name,
+            "team": team,
+            "GP": int(gp),
+            "Avg": avg,
+            "source_url": url,
+            "collected_at_utc": collected_at,
+        }
+
+        for metric in ("0.5+", "1.5+", "2.5+", "3.5+"):
+            idx = indexes[metric]
+
+            if idx is not None and idx < len(cells):
+                record[metric] = parse_number(cells[idx])
+            else:
+                record[metric] = None
+
+        records.append(record)
+
+    if not records:
+        save_debug(
+            slug,
+            response.text,
+            f"Таблицю знайдено, але команд не розпізнано. Заголовки: {headers}",
+        )
+        raise RuntimeError(
+            "У таблиці не розпізнано жодної команди."
+        )
+
+    print(f"[OK] Команд зібрано: {len(records)}")
+
+    for record in records[:5]:
+        print(
+            f"{record['team']} | "
+            f"GP={record['GP']} | "
+            f"Avg={record['Avg']} | "
+            f"0.5+={record['0.5+']} | "
+            f"1.5+={record['1.5+']}"
+        )
+
+    return records
+
 
 def main():
-    only = sys.argv[1:]  # необов'язково: список slug для проби
-    leagues = {s: s for s in only} if only else list_leagues()
-    done = set()
-    if os.path.exists(OUT):
-        with open(OUT, encoding='utf-8') as f:
-            done = {(r['slug'], r['season_label']) for r in csv.DictReader(f)}
-    new = not os.path.exists(OUT)
-    with open(OUT, 'a', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, FIELDS)
-        if new: w.writeheader()
-        for base, name in leagues.items():
-            try:
-                url0 = f'{BASE}halftime.asp?league={base}'
-                seasons = parse_page(get(url0))[0]
-                targets = {}
-                for lab, slug in seasons.items():
-                    y = int(lab[:4])
-                    if y in (2025, 2026): targets[lab] = slug
-                if not targets:
-                    print('нема сезонів 2025/2026:', base); continue
-                for lab, slug in targets.items():
-                    if (slug, lab) in done: continue
-                    url = f'{BASE}halftime.asp?league={slug}'
-                    _, matches, mtab, avg, pct = parse_page(get(url))
-                    if not matches or not pct or avg is None:
-                        print('НЕМАЄ ДАНИХ 2Т:', slug, lab); continue
-                    w.writerow(dict(slug=slug, league_name=name, season_label=lab, matches=matches,
-                                    p05=pct[0], p15=pct[1], p25=pct[2],
-                                    avg_goals_2h=avg, matches_table=mtab, url=url))
-                    f.flush(); print('ok', slug, lab, matches)
-            except Exception as e:
-                print('ПОМИЛКА', base, e)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-if __name__ == '__main__':
-    main()
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    all_records = []
+    errors = []
+
+    for slug, league_name in LEAGUES.items():
+        try:
+            records = fetch_league(
+                session,
+                slug,
+                league_name,
+            )
+            all_records.extend(records)
+
+        except Exception as exc:
+            message = (
+                f"{league_name} ({slug}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            errors.append(message)
+            print(f"[ERROR] {message}", file=sys.stderr)
+
+        time.sleep(REQUEST_DELAY)
+
+    if all_records:
+        with CSV_FILE.open(
+            "w",
+            newline="",
+            encoding="utf-8-sig",
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=CSV_COLUMNS,
+            )
+            writer.writeheader()
+            writer.writerows(all_records)
+
+        print(f"\n[DONE] Рядків у CSV: {len(all_records)}")
+        print(f"[CSV] {CSV_FILE}")
+
+    else:
+        print("\n[FAIL] Дані не зібрано. CSV не створено.")
+
+    if errors:
+        (DEBUG_DIR / "errors.txt").write_text(
+            "\n".join(errors) + "\n",
+            encoding="utf-8",
+        )
+        print("[WARN] Деталі помилок збережено в debug/errors.txt")
+        return 1
+
+    return 0 if all_records else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
