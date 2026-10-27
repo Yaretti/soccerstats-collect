@@ -1,0 +1,23 @@
+name: soccerstats-collect
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: 'Проба: slug ліги (напр. qatar). Порожньо = усі'
+        required: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests beautifulsoup4
+      - run: python soccerstats_collect.py ${{ inputs.slug }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soccerstats_stats
+          path: soccerstats_stats.csv
