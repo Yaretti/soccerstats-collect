@@ -29,7 +29,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run parser
-        run: python src/soccerstats_collect.py
+        run: python. soccerstats_collect.py
 
       - name: Upload CSV and diagnostics
         if: always()
