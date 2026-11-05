@@ -1,0 +1,36 @@
+
+name: SoccerSTATS Total Processor
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'input/**'
+      - 'soccerstats_total_processor.py'
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run processor
+        run: python soccerstats_total_processor.py
+
+      - name: Commit processed data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git diff --cached --quiet || git commit -m "Update SoccerSTATS Total database"
+          git push
